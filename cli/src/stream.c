@@ -526,10 +526,11 @@ static void close_muxer(StreamContext *ctx)
 	chiaki_mutex_unlock(&ctx->mux_mutex);
 }
 
-static void inspect_annexb_nal(const uint8_t *buf, size_t buf_size, ChiakiCodec codec, bool *out_is_header, bool *out_is_keyframe)
+static size_t count_and_inspect_annexb_nals(const uint8_t *buf, size_t buf_size, ChiakiCodec codec, bool *out_is_header, bool *out_is_keyframe)
 {
 	*out_is_header = false;
 	*out_is_keyframe = false;
+	size_t nal_count = 0;
 
 	size_t i = 0;
 	while(i + 4 <= buf_size)
@@ -542,6 +543,7 @@ static void inspect_annexb_nal(const uint8_t *buf, size_t buf_size, ChiakiCodec 
 
 		if(sc_len > 0 && (i + sc_len) < buf_size)
 		{
+			nal_count++;
 			uint8_t nal_byte = buf[i + sc_len];
 			if(chiaki_codec_is_h265(codec))
 			{
@@ -559,8 +561,6 @@ static void inspect_annexb_nal(const uint8_t *buf, size_t buf_size, ChiakiCodec 
 				else if(nal_type == 5)
 					*out_is_keyframe = true;
 			}
-			if(*out_is_keyframe)
-				break;
 			i += sc_len + 1;
 		}
 		else
@@ -568,6 +568,85 @@ static void inspect_annexb_nal(const uint8_t *buf, size_t buf_size, ChiakiCodec 
 			i++;
 		}
 	}
+	return nal_count;
+}
+
+#define MAX_NALUS_PER_AVPACKET 40
+
+static bool write_single_video_avpacket_locked(StreamContext *ctx, const uint8_t *data, size_t size, bool is_keyframe)
+{
+	uint64_t now_us = chiaki_time_now_monotonic_us();
+	uint64_t rel_us = (now_us > ctx->start_time_us) ? (now_us - ctx->start_time_us) : 0;
+	int64_t dts = av_rescale_q((int64_t)rel_us, (AVRational){ 1, 1000000 }, ctx->video_st->time_base);
+	if(dts <= ctx->last_video_dts)
+		dts = ctx->last_video_dts + 1;
+	ctx->last_video_dts = dts;
+
+	AVPacket *pkt = av_packet_alloc();
+	if(!pkt)
+		return false;
+
+	pkt->data = (uint8_t *)data;
+	pkt->size = (int)size;
+	pkt->stream_index = ctx->video_st->index;
+	pkt->pts = dts;
+	pkt->dts = dts;
+	if(is_keyframe)
+		pkt->flags |= AV_PKT_FLAG_KEY;
+
+	int ret = av_interleaved_write_frame(ctx->fmt_ctx, pkt);
+	av_packet_free(&pkt);
+	if(ret < 0)
+	{
+		CHIAKI_LOGW(ctx->log, "Video mux write failed: %s", av_err2str(ret));
+		ctx->mux_failed = true;
+		ctx->session_quit = true;
+		chiaki_stop_pipe_stop(&ctx->session_stop_pipe);
+		return false;
+	}
+	return true;
+}
+
+static bool write_video_avpacket_locked(StreamContext *ctx, const uint8_t *data, size_t size, bool is_keyframe)
+{
+	// MediaMTX (gortsplib) enforces max 50 NALUs per RTP Marker (M=1) access unit.
+	// Split frames with > MAX_NALUS_PER_AVPACKET NALUs at Annex-B start code boundaries.
+	size_t chunk_start = 0;
+	size_t nal_in_chunk = 0;
+	size_t i = 0;
+	bool first_chunk = true;
+
+	while(i + 4 <= size)
+	{
+		size_t sc_len = 0;
+		if(data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
+			sc_len = 3;
+		else if(i + 4 < size && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x00 && data[i + 3] == 0x01)
+			sc_len = 4;
+
+		if(sc_len > 0)
+		{
+			if(nal_in_chunk >= MAX_NALUS_PER_AVPACKET && i > chunk_start)
+			{
+				if(!write_single_video_avpacket_locked(ctx, data + chunk_start, i - chunk_start, is_keyframe && first_chunk))
+					return false;
+				chunk_start = i;
+				nal_in_chunk = 0;
+				first_chunk = false;
+			}
+			nal_in_chunk++;
+			i += sc_len + 1;
+		}
+		else
+		{
+			i++;
+		}
+	}
+
+	if(size > chunk_start)
+		return write_single_video_avpacket_locked(ctx, data + chunk_start, size - chunk_start, is_keyframe && first_chunk);
+
+	return true;
 }
 
 static bool video_sample_cb(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user)
@@ -580,7 +659,7 @@ static bool video_sample_cb(uint8_t *buf, size_t buf_size, int32_t frames_lost, 
 
 	bool is_header = false;
 	bool is_keyframe = false;
-	inspect_annexb_nal(buf, buf_size, ctx->args->codec, &is_header, &is_keyframe);
+	size_t nal_count = count_and_inspect_annexb_nals(buf, buf_size, ctx->args->codec, &is_header, &is_keyframe);
 
 	chiaki_mutex_lock(&ctx->mux_mutex);
 
@@ -606,56 +685,17 @@ static bool video_sample_cb(uint8_t *buf, size_t buf_size, int32_t frames_lost, 
 		return false;
 	}
 
-	uint8_t *combined_buf = NULL;
-	const uint8_t *pkt_data = buf;
-	size_t pkt_size = buf_size;
-
-	if(is_keyframe && ctx->sps_pps_buf && ctx->sps_pps_size > 0)
+	if(is_keyframe)
 	{
-		pkt_size = ctx->sps_pps_size + buf_size;
-		combined_buf = malloc(pkt_size);
-		if(combined_buf)
+		CHIAKI_LOGI(ctx->log, "Received IDR keyframe (%zu bytes, %zu NALUs)", buf_size, nal_count);
+		if(ctx->sps_pps_buf && ctx->sps_pps_size > 0 && !is_header)
 		{
-			memcpy(combined_buf, ctx->sps_pps_buf, ctx->sps_pps_size);
-			memcpy(combined_buf + ctx->sps_pps_size, buf, buf_size);
-			pkt_data = combined_buf;
-		}
-		else
-		{
-			pkt_size = buf_size;
+			// Send SPS/PPS as a separate access unit so combined NALU count never exceeds MediaMTX's 50-NALU limit
+			write_video_avpacket_locked(ctx, ctx->sps_pps_buf, ctx->sps_pps_size, false);
 		}
 	}
 
-	uint64_t now_us = chiaki_time_now_monotonic_us();
-	uint64_t rel_us = (now_us > ctx->start_time_us) ? (now_us - ctx->start_time_us) : 0;
-	int64_t dts = av_rescale_q((int64_t)rel_us, (AVRational){ 1, 1000000 }, ctx->video_st->time_base);
-	if(dts <= ctx->last_video_dts)
-		dts = ctx->last_video_dts + 1;
-	ctx->last_video_dts = dts;
-
-	AVPacket *pkt = av_packet_alloc();
-	if(pkt)
-	{
-		pkt->data = (uint8_t *)pkt_data;
-		pkt->size = (int)pkt_size;
-		pkt->stream_index = ctx->video_st->index;
-		pkt->pts = dts;
-		pkt->dts = dts;
-		if(is_keyframe)
-			pkt->flags |= AV_PKT_FLAG_KEY;
-
-		int ret = av_interleaved_write_frame(ctx->fmt_ctx, pkt);
-		if(ret < 0)
-		{
-			CHIAKI_LOGW(ctx->log, "Video mux write failed: %s", av_err2str(ret));
-			ctx->mux_failed = true;
-			ctx->session_quit = true;
-			chiaki_stop_pipe_stop(&ctx->session_stop_pipe);
-		}
-		av_packet_free(&pkt);
-	}
-
-	free(combined_buf);
+	write_video_avpacket_locked(ctx, buf, buf_size, is_keyframe);
 	chiaki_mutex_unlock(&ctx->mux_mutex);
 	return true;
 }
