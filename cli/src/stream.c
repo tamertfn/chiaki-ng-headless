@@ -755,11 +755,11 @@ static int run_single_stream_session(ChiakiLog *log, const StreamArguments *args
 	chiaki_connect_video_profile_preset(&connect_info.video_profile, args->resolution, args->fps);
 	connect_info.video_profile.bitrate = args->bitrate;
 	connect_info.video_profile.codec = args->codec;
-	connect_info.video_profile_auto_downgrade = true;
+	connect_info.video_profile_auto_downgrade = false;
 	connect_info.enable_keyboard = false;
 	connect_info.enable_dualsense = false;
 	connect_info.enable_idr_on_fec_failure = true;
-	connect_info.packet_loss_max = 0.05;
+	connect_info.packet_loss_max = 0.0;
 	connect_info.audio_video_disabled = args->no_audio ? CHIAKI_AUDIO_DISABLED : CHIAKI_NONE_DISABLED;
 
 	ChiakiErrorCode err = chiaki_session_init(&ctx.session, &connect_info, log);
