@@ -43,7 +43,7 @@
 #define TAKION_INBOUND_STREAMS 0x64
 
 #define TAKION_REORDER_QUEUE_SIZE_EXP 4 // => 16 entries
-#define TAKION_AV_VIDEO_REORDER_QUEUE_SIZE_EXP 6 // => 64 entries
+#define TAKION_AV_VIDEO_REORDER_QUEUE_SIZE_EXP 8 // => 256 entries
 #define TAKION_AV_REORDER_TIMEOUT_US 16000 // ~1 frame at 60fps
 
 #define TAKION_POSTPONE_PACKETS_SIZE 32
@@ -261,7 +261,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
 			CHIAKI_LOGE(takion->log, "Takion had problem reading extra messages from socket using PSN Connection with error: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
 			goto error_sock;
 		}
-		const int rcvbuf_val = takion->a_rwnd;
+		const int rcvbuf_val = 2 * 1024 * 1024;
 		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
 		if(r < 0)
 		{
@@ -349,7 +349,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
 			ret = CHIAKI_ERR_NETWORK;
 			goto error_pipe;
 		}
-		const int rcvbuf_val = takion->a_rwnd;
+		const int rcvbuf_val = 2 * 1024 * 1024;
 		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
 		if(r < 0)
 		{

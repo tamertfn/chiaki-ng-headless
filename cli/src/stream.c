@@ -571,9 +571,7 @@ static size_t count_and_inspect_annexb_nals(const uint8_t *buf, size_t buf_size,
 	return nal_count;
 }
 
-#define MAX_NALUS_PER_AVPACKET 40
-
-static bool write_single_video_avpacket_locked(StreamContext *ctx, const uint8_t *data, size_t size, bool is_keyframe)
+static bool write_video_avpacket_locked(StreamContext *ctx, const uint8_t *data, size_t size, bool is_keyframe)
 {
 	uint64_t now_us = chiaki_time_now_monotonic_us();
 	uint64_t rel_us = (now_us > ctx->start_time_us) ? (now_us - ctx->start_time_us) : 0;
@@ -604,48 +602,6 @@ static bool write_single_video_avpacket_locked(StreamContext *ctx, const uint8_t
 		chiaki_stop_pipe_stop(&ctx->session_stop_pipe);
 		return false;
 	}
-	return true;
-}
-
-static bool write_video_avpacket_locked(StreamContext *ctx, const uint8_t *data, size_t size, bool is_keyframe)
-{
-	// MediaMTX (gortsplib) enforces max 50 NALUs per RTP Marker (M=1) access unit.
-	// Split frames with > MAX_NALUS_PER_AVPACKET NALUs at Annex-B start code boundaries.
-	size_t chunk_start = 0;
-	size_t nal_in_chunk = 0;
-	size_t i = 0;
-	bool first_chunk = true;
-
-	while(i + 4 <= size)
-	{
-		size_t sc_len = 0;
-		if(data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
-			sc_len = 3;
-		else if(i + 4 < size && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x00 && data[i + 3] == 0x01)
-			sc_len = 4;
-
-		if(sc_len > 0)
-		{
-			if(nal_in_chunk >= MAX_NALUS_PER_AVPACKET && i > chunk_start)
-			{
-				if(!write_single_video_avpacket_locked(ctx, data + chunk_start, i - chunk_start, is_keyframe && first_chunk))
-					return false;
-				chunk_start = i;
-				nal_in_chunk = 0;
-				first_chunk = false;
-			}
-			nal_in_chunk++;
-			i += sc_len + 1;
-		}
-		else
-		{
-			i++;
-		}
-	}
-
-	if(size > chunk_start)
-		return write_single_video_avpacket_locked(ctx, data + chunk_start, size - chunk_start, is_keyframe && first_chunk);
-
 	return true;
 }
 
@@ -686,14 +642,7 @@ static bool video_sample_cb(uint8_t *buf, size_t buf_size, int32_t frames_lost, 
 	}
 
 	if(is_keyframe)
-	{
 		CHIAKI_LOGI(ctx->log, "Received IDR keyframe (%zu bytes, %zu NALUs)", buf_size, nal_count);
-		if(ctx->sps_pps_buf && ctx->sps_pps_size > 0 && !is_header)
-		{
-			// Send SPS/PPS as a separate access unit so combined NALU count never exceeds MediaMTX's 50-NALU limit
-			write_video_avpacket_locked(ctx, ctx->sps_pps_buf, ctx->sps_pps_size, false);
-		}
-	}
 
 	write_video_avpacket_locked(ctx, buf, buf_size, is_keyframe);
 	chiaki_mutex_unlock(&ctx->mux_mutex);

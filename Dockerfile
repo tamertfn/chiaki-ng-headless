@@ -45,6 +45,17 @@ RUN cmake -B build \
     && cmake --build build --target chiaki-cli -j"$(nproc)" \
     && install -D -m 0755 build/cli/chiaki-cli /out/usr/local/bin/chiaki-cli
 
+FROM golang:alpine AS mediamtx-builder
+RUN apk add --no-cache git \
+    && git clone --depth 1 --branch v1.21.4 https://github.com/bluenviron/mediamtx.git /mediamtx \
+    && cd /mediamtx \
+    && go generate ./... \
+    && go mod download \
+    && chmod -R u+w /go/pkg/mod/github.com/bluenviron/mediacommon* \
+    && sed -i 's/MaxNALUsPerAccessUnit = 50/MaxNALUsPerAccessUnit = 256/g' /go/pkg/mod/github.com/bluenviron/mediacommon/v2@*/pkg/codecs/h264/h264.go \
+    && sed -i 's/MaxNALUsPerAccessUnit = 21/MaxNALUsPerAccessUnit = 256/g' /go/pkg/mod/github.com/bluenviron/mediacommon/v2@*/pkg/codecs/h265/h265.go \
+    && CGO_ENABLED=0 go build -ldflags="-s -w" -o /mediamtx-bin .
+
 FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -65,6 +76,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd -u 10001 -g 10001 -M -s /usr/sbin/nologin chiaki
 
 COPY --from=builder /out/usr/local/ /usr/local/
+COPY --from=mediamtx-builder /mediamtx-bin /usr/local/bin/mediamtx
 RUN ldconfig
 
 USER 10001:10001
